@@ -1,0 +1,131 @@
+#!/bin/bash
+
+# To do
+#   Send errors via HTTP
+
+# Identify yourself to the rsync client
+echo -e "\n$0: $RSYNC_PID\n" > /dev/stderr
+
+# Not installed correctly
+[ ! -L $0 ] && exit 1
+
+# Not running under rsync pre-/post-xfer exec
+[ -z "$RSYNC_PID" ] && exit 1
+
+# Source a global config file if found
+SCRIPT=$(basename $0)
+SNAPROOT=$(dirname $0)
+ORGCODE=$(basename $RSYNC_MODULE_PATH)
+[ ! -f $SNAPROOT/.config -o ! -s $SNAPROOT/.config ] && echo SYMNAME=current > $SNAPROOT/.config
+[ -f $SNAPROOT/.config ] && . $SNAPROOT/.config
+# Source a module-level config file if found
+MP=$RSYNC_MODULE_PATH
+[ ! -f $MP/.config -o ! -s $MP/.config ] && echo SYMNAME=current > $MP/.config
+[ -f $MP/.config ] && . $MP/.config
+# SYMNAME is only defined in a config file, so if no file was sourced, exit
+[ -z "$SYMNAME" ] && exit 1
+
+PIDFILE=.$RSYNC_PID.pid
+
+mail () {
+	[ -x sendemail ] || return
+	[ "$1" != "ERR" -a "$1" != "OK" ] && return
+	SUBJECT="$1 : $ORGCODE / ${HOST:-$RSYNC_HOST_ADDR} : ${2%\\n}"
+	BODY="$2"
+	[ -n "$3" -a -f "$3" ] && BODY="$BODY\n\n$(< $3)"
+	[ "$1" == "OK" -a -n "$MAILOK" -a -z "$MAILTO" ] && sendemail -f "snapshots@${HOST:-$RSYNC_HOST_NAME}" -t $MAILTO -u "$SUBJECT" -m "$BODY" -s "${SMTP:-localhost}"
+	[ "$1" == "ERR" ] && sendemail -f "snapshots@${HOST:-$RSYNC_HOST_NAME}" -t $MAILTO stefan@cogentinnovators.com -u "$SUBJECT" -m "$BODY" -s "${SMTP:-localhost}"
+}
+
+ok () {
+	OK="$1"
+	mail "OK" "$OK"
+	exit 0
+}
+
+err () {
+	ERR="$1"
+	TIME=$(date)
+	echo -e "$ERR" > /dev/stderr
+	# Forget who's the most recent archive
+	[ -n "$SYMNAME" -a -f $MP/$HOST/$SYMNAME ] && rm -f $MP/$HOST/$SYMNAME
+	# Throw special attention to the fact that there are more than ERRS error flags sitting around
+	ALERTS=$(find $SNAPROOT -mindepth 1 -maxdepth 1 -name "$ORGCODE.err-*" | tee /tmp/snapshots-alerts.$RSYNC_PID | wc -l)
+	[ "$ALERTS" -gt "${ERRS:-7}" ] && mail "ERR" "$ALERTS unacknowledged errors" /tmp/snapshots-alerts.$RSYNC_PID && rm -f /tmp/snapshots-alerts.$RSYNC_PID
+	# Throw a visible file system flag to indicate that an error was caught
+	set | sed '/^{/,/^}/d' > $SNAPROOT/$ORGCODE.err-$SCRIPT.$RSYNC_PID
+	mail "ERR" "$ERR" $SNAPROOT/$ORGCODE.err-$SCRIPT.$RSYNC_PID
+	exit 1;
+}
+
+if [ "$SCRIPT" == "pre-rsync" ]; then
+	# Check for existing backup process
+	PIDS=$(find $MP -maxdepth 1 -name ".*.pid" | wc -l ); PIDS=${PIDS:-0}
+	[ "$PIDS" -ge 1 ] && err "Last backup not finished: $MP/.*.pid\n"
+	# Setup the environment for post
+	DATE=$(basename $RSYNC_REQUEST | sed 's/^.//')
+	HOST=$(basename $(dirname $RSYNC_REQUEST))
+	echo -e "DATE=$DATE\nHOST=$HOST" > $MP/$PIDFILE || err "Cannot create $MP/$PIDFILE\n"
+elif [ "$SCRIPT" == "post-rsync" ]; then
+	# Check for existing backup process
+	[ ! -e $MP/$PIDFILE ] && err "No current backup running: $MP/$PIDFILE\n"
+	PIDFILECONTENTS="$(<$MP/$PIDFILE)"
+	. $MP/$PIDFILE
+	rm -f $MP/$PIDFILE
+else
+	err "$SCRIPT not understood\n"
+fi
+
+# Make sure some necessary variables are set
+[ -z "$DATE" ] && err "DATE not set.\n"
+[ -z "$HOST" ] && err "HOST not set.\n"
+
+# Source a host-level config file if found
+[ -f $MP/$HOST/.config ] && . $MP/$HOST/.config
+
+echo Days: $DAYS
+echo Keep: $KEEP
+
+if [ "$SCRIPT" == "pre-rsync" ]; then
+	# Remove incomplete backup .dirs
+	find $MP/$HOST -mindepth 1 -maxdepth 1 -type d -name ".*" -exec rm -rf '{}' \; -print > /dev/stderr
+	# Remove old pid files
+	find $MP -mindepth 1 -maxdepth 1 -type d -name ".*.pid" -mtime +30 -exec rm -f '{}' \;
+	# Remove archives greater than DAYS days old as long as there will remain at least KEEP archives less than X days old
+	RECENT=$(find $MP/$HOST -mindepth 1 -maxdepth 1 -type d ! -name ".*" -mtime -$((${DAYS:-14}-1)) | wc -l)
+	[ "$RECENT" -gt "${KEEP:-7}" ] && find $MP/$HOST -mindepth 1 -maxdepth 1 -type d ! -name ".*" -mtime +${DAYS:-14} -exec rm -rf '{}' \; -print > /dev/stderr
+	# Keep at most Z archives, keep the newest and remove the oldest
+	#ARCHIVES=$(find $MP/$HOST -mindepth 1 -maxdepth 1 -type d ! -name ".*" | wc -l)
+	#[ "$ARCHIVES" -gt "${ATMOST:-30}" ] && find $MP/$HOST -mindepth 1 -maxdepth 1 -type d -mtime +${DAYS:-14} -exec rm -rf '{}' \; -print > /dev/stderr
+	# Identify most recent archive
+	LATEST=$(find $MP/$HOST -mindepth 1 -maxdepth 1 -type d ! -name ".*" -exec basename '{}' \; | sort -n | tail -1)
+	# Set the current archive to the most recent archive
+	[ ! -e $MP/$HOST/$SYMNAME -a -n "$LATEST" -a -d "$MP/$HOST/$LATEST" ] && ln -s $LATEST $MP/$HOST/$SYMNAME
+	[ ! -L $MP/$HOST/$SYMNAME ] && err "No current backup: $MP/$HOST/$SYMNAME"
+elif [ "$SCRIPT" == "post-rsync" ]; then
+	REQUESTTMP=$MP/$HOST/.$DATE
+	REQUEST=$MP/$HOST/$DATE
+	rm -f $MP/$PIDFILE || err "Cannot rm: $MP/$PIDFILE\n"
+	if [ -e $SNAPROOT/$ORGCODE.err-$SCRIPT.$RSYNC_PID ]; then
+		err "pre-rsync error pid $RSYNC_PID\n"
+	fi
+	if [ "$RSYNC_EXIT_STATUS" -eq 0 -o "$RSYNC_EXIT_STATUS" -eq 23 -o "$RSYNC_EXIT_STATUS" -eq 24 ]; then
+		# Cleanup
+		rm -f $MP/$HOST/$SYMNAME || err "Cannot rm: $MP/$HOST/$SYMNAME\n"
+		mv $REQUESTTMP $REQUEST || err "Cannot mv: $REQUESTTMP -> $REQUEST\n"
+		ln -s $DATE $MP/$HOST/$SYMNAME || err "Cannot ln: $DATE -> $MP/$HOST/$SYMNAME\n"
+		# Send success
+		ok "Success!"
+	else
+		# Send error for $MP/$HOST/$DATE
+		# Hints to report in log:
+		# o make sure current points to the latest
+		# o make sure no .tmp file exists
+		# o remove any .dirs
+		err "RSYNC_EXIT_STATUS: $RSYNC_EXIT_STATUS\n"
+	fi
+else
+	err "$SCRIPT not understood\n"
+fi
+
+exit 0
